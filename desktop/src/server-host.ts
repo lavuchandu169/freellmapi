@@ -22,7 +22,7 @@ import { loadCacheFromDb } from '../../server/src/services/cache.js';
 import { startWakeDetect } from '../../server/src/lib/wake-detect.js';
 import { installProcessSafetyNet } from '../../server/src/lib/process-safety-net.js';
 import { installLogRedaction } from '../../server/src/lib/log-redaction.js';
-import { userCount, createUser, createSession } from '../../server/src/services/auth.js';
+import { userCount, createUser, createSession, normalizeEmail } from '../../server/src/services/auth.js';
 import { NodeScheduler } from '../../server/src/lib/scheduler.js';
 
 export { getDb, getUnifiedApiKey };
@@ -86,6 +86,20 @@ export async function startServer(opts: StartOptions): Promise<ServerHandle> {
   // 0.0.0.0, and a remote viewer must still enter the password.
   process.env.FREEAPI_DESKTOP = '1';
   initDb(opts.dbPath);
+  // Security audit finding (localagent fork patch, VULN-03:
+  // freellmapi-server:auth-setup-loopback-trust-bypass): claim the machine
+  // user BEFORE the HTTP server below ever starts accepting connections,
+  // not after. Previously this only happened when the embedder (localagent's
+  // freellmapiHost.ts) called ensureSessionToken() post-startServer(), which
+  // left a real window — however small — after the port opened during which
+  // ANY loopback caller could win POST /api/auth/setup's no-code first-run
+  // path (see routes/auth.ts's isLoopbackRemote branch) and become the
+  // permanent sole admin. Doing it here, before listenWithScan() opens the
+  // port, closes the window entirely rather than shrinking it: nothing can
+  // reach the HTTP layer yet, loopback or not, so there is no caller to race
+  // against. ensureSessionToken() below now only ever mints a session for
+  // the identity this claims here — see its own updated doc comment.
+  claimMachineAccountIfNeeded();
   // One sweep at boot, while the DB is quiet — expired cooldown rows are only
   // collected lazily per route and would otherwise accumulate forever.
   const expiredCooldowns = cleanupExpiredCooldowns();
@@ -131,14 +145,50 @@ export async function startServer(opts: StartOptions): Promise<ServerHandle> {
   return { server, port };
 }
 
-// The dashboard window authenticates as a hidden machine user. The password
-// is random and never shown — sessions are minted directly against the DB.
-export function ensureSessionToken(): string {
+// The dashboard window authenticates as a hidden machine user, identified by
+// this fixed email — never shown in any UI, just a stable key this module
+// uses to recognize "the account I created" across restarts.
+const MACHINE_USER_EMAIL = 'desktop@localhost';
+
+/** Idempotent: creates the machine user only if no user exists yet. Called
+ * from startServer() before the HTTP server starts listening — see that
+ * call site's own doc comment for why "before listening" is what actually
+ * closes the admin-claim race, not just narrows it. */
+function claimMachineAccountIfNeeded(): void {
   if (userCount() === 0) {
-    createUser('desktop@localhost', crypto.randomBytes(24).toString('hex'));
+    createUser(MACHINE_USER_EMAIL, crypto.randomBytes(24).toString('hex'));
   }
-  const first = getDb().prepare('SELECT id FROM users ORDER BY id ASC LIMIT 1').get() as { id: number };
-  return createSession(first.id);
+}
+
+/** Mints a session for the machine user claimed by startServer() above.
+ * Security audit finding (localagent fork patch, VULN-03): previously this
+ * blindly adopted whichever user happened to be "first by id" — if some
+ * OTHER local process won the setup race before this ran, that query
+ * returned THEIR row, and this function silently minted the desktop app a
+ * session for an account it never created and doesn't control. Looking up
+ * MACHINE_USER_EMAIL specifically means this only ever authenticates as the
+ * identity this process itself claimed; if that row is missing while some
+ * other account already exists, something claimed the dashboard before
+ * startServer()'s pre-listen claim could — which should no longer be
+ * reachable in practice, but is treated as a hard failure rather than
+ * silently impersonating whatever account exists. */
+export function ensureSessionToken(): string {
+  const existing = getDb()
+    .prepare('SELECT id FROM users WHERE email = ?')
+    .get(normalizeEmail(MACHINE_USER_EMAIL)) as { id: number } | undefined;
+  if (existing) {
+    return createSession(existing.id);
+  }
+  if (userCount() > 0) {
+    throw new Error(
+      'FreeLLMAPI dashboard account exists under a different identity than this process created — refusing to adopt it.',
+    );
+  }
+  claimMachineAccountIfNeeded();
+  const claimed = getDb()
+    .prepare('SELECT id FROM users WHERE email = ?')
+    .get(normalizeEmail(MACHINE_USER_EMAIL)) as { id: number };
+  return createSession(claimed.id);
 }
 
 async function listenWithScan(
